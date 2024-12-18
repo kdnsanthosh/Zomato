@@ -2,107 +2,137 @@ pipeline {
     agent any
     tools {
         jdk 'jdk17'
-        nodejs 'node23'
+        nodejs 'nodejs'
     }
     environment {
-        SCANNER_HOME=tool 'sonar-scanner'
+        SCANNER_HOME= tool 'sonar-scanner'
     }
     stages {
+        
         stage ("clean workspace") {
             steps {
                 cleanWs()
             }
         }
-        stage ("Git Checkout") {
+        
+        stage('Git Checkout') {
             steps {
-                git 'https://github.com/KastroVKiran/Zomato-Project-Kastro.git'
+               checkout scmGit(branches: [[name: '*/master']], extensions: [], userRemoteConfigs: [[url: 'https://github.com/kdnsanthosh/Zomato.git']])
             }
         }
-        stage("Sonarqube Analysis"){
-            steps{
+        
+        stage('SonarQube Analsyis') {
+            steps {
                 withSonarQubeEnv('sonar-server') {
-                    sh ''' $SCANNER_HOME/bin/sonar-scanner -Dsonar.projectName=zomato \
-                    -Dsonar.projectKey=zomato '''
+                    sh ''' $SCANNER_HOME/bin/sonar-scanner -Dsonar.projectName=Zomato -Dsonar.projectKey=Zomato \
+                    -Dsonar.java.binaries=. '''
                 }
             }
         }
-        stage("Code Quality Gate"){
-           steps {
+        
+        stage('Quality Gate') {
+            steps {
                 script {
-                    waitForQualityGate abortPipeline: false, credentialsId: 'Sonar-token' 
+                  waitForQualityGate abortPipeline: false, credentialsId: 'sonar-token' 
                 }
-            } 
+            }
         }
-        stage("Install NPM Dependencies") {
+        
+         stage("Install NPM Dependencies") {
             steps {
                 sh "npm install"
             }
         }
-        stage('OWASP FS SCAN') {
+        
+        //  stage('OWASP FS SCAN') {
+        //     steps {
+        //         dependencyCheck additionalArguments: '--scan ./ --disableYarnAudit --disableNodeAudit -n', odcInstallation: 'DP-Check'
+        //         dependencyCheckPublisher pattern: '**/dependency-check-report.xml'
+        //     }
+        // }
+        stage('File System Scan') {
             steps {
-                dependencyCheck additionalArguments: '--scan ./ --disableYarnAudit --disableNodeAudit -n', odcInstallation: 'DP-Check'
-                dependencyCheckPublisher pattern: '**/dependency-check-report.xml'
-    }
-}
-        stage ("Trivy File Scan") {
-            steps {
-                sh "trivy fs . > trivy.txt"
+                sh "trivy fs --format table -o trivy-fs-report.html ."
             }
         }
-        stage ("Build Docker Image") {
+        
+        stage('Build & Tag Docker Image') {
             steps {
-                sh "docker build -t zomato ."
-            }
-        }
-        stage ("Tag & Push to DockerHub") {
-            steps {
-                script {
-                    withDockerRegistry(credentialsId: 'docker') {
-                        sh "docker tag zomato kastrov/zomato:latest "
-                        sh "docker push kastrov/zomato:latest "
+               script {
+                   withDockerRegistry(credentialsId: 'docker-cred', toolName: 'docker') {
+                            sh "docker build -t jilla5858/zomato:latest ."
                     }
+               }
+            }
+        }
+        
+        stage('Docker Image Scan') {
+            steps {
+                sh "trivy image --format table -o trivy-image-report.html jilla5858/zomato:latest "
+            }
+        }
+        
+        stage('Push Docker Image') {
+            steps {
+               script {
+                   withDockerRegistry(credentialsId: 'docker-cred', toolName: 'docker') {
+                            sh "docker push jilla5858/zomato:latest"
+                    }
+               }
+            }
+        }
+        stage('Deploy To Kubernetes') {
+            steps {
+               withKubeConfig(caCertificate: '', clusterName: 'do-blr1-k8s-mycluster-01', contextName: '', credentialsId: 'k8-token', namespace: 'webapps', restrictKubeConfigAccess: false, serverUrl: 'https://f53d48c8-2287-4a47-bf25-88141c3f8271.k8s.ondigitalocean.com')  {
+                        sh "kubectl apply -f /var/lib/jenkins/workspace/Zomato/Kubernetes/deployment.yaml "
+                        sh "kubectl apply -f /var/lib/jenkins/workspace/Zomato/Kubernetes/service.yaml "
+                        sleep 60
                 }
             }
         }
-        stage('Docker Scout Image') {
+        
+        stage('Verify the Deployment') {
             steps {
-                script{
-                   withDockerRegistry(credentialsId: 'docker', toolName: 'docker'){
-                       sh 'docker-scout quickview kastrov/zomato:latest'
-                       sh 'docker-scout cves kastrov/zomato:latest'
-                       sh 'docker-scout recommendations kastrov/zomato:latest'
-                   }
+               withKubeConfig(caCertificate: '', clusterName: 'do-blr1-k8s-mycluster-01', contextName: '', credentialsId: 'k8-token', namespace: 'webapps', restrictKubeConfigAccess: false, serverUrl: 'https://f53d48c8-2287-4a47-bf25-88141c3f8271.k8s.ondigitalocean.com')  {
+                        sh "kubectl get pods -n webapps"
+                        sh "kubectl get svc -n webapps"
                 }
-            }
-        }
-        stage ("Deploy to Container") {
-            steps {
-                sh 'docker run -d --name zomato -p 3000:3000 kastrov/zomato:latest'
             }
         }
     }
     post {
     always {
-        emailext attachLog: true,
-            subject: "'${currentBuild.result}'",
-            body: """
+        script {
+            def jobName = env.JOB_NAME
+            def buildNumber = env.BUILD_NUMBER
+            def pipelineStatus = currentBuild.result ?: 'UNKNOWN'
+            def bannerColor = pipelineStatus.toUpperCase() == 'SUCCESS' ? 'green' : 'red'
+
+            def body = """
                 <html>
                 <body>
-                    <div style="background-color: #FFA07A; padding: 10px; margin-bottom: 10px;">
-                        <p style="color: white; font-weight: bold;">Project: ${env.JOB_NAME}</p>
-                    </div>
-                    <div style="background-color: #90EE90; padding: 10px; margin-bottom: 10px;">
-                        <p style="color: white; font-weight: bold;">Build Number: ${env.BUILD_NUMBER}</p>
-                    </div>
-                    <div style="background-color: #87CEEB; padding: 10px; margin-bottom: 10px;">
-                        <p style="color: white; font-weight: bold;">URL: ${env.BUILD_URL}</p>
-                    </div>
+                <div style="border: 4px solid ${bannerColor}; padding: 10px;">
+                <h2>${jobName} - Build ${buildNumber}</h2>
+                <div style="background-color: ${bannerColor}; padding: 10px;">
+                <h3 style="color: white;">Pipeline Status: ${pipelineStatus.toUpperCase()}</h3>
+                </div>
+                <p>Check the <a href="${BUILD_URL}">console output</a>.</p>
+                </div>
                 </body>
                 </html>
-            """,
-            to: 'kastrokiran@gmail.com',
-            mimeType: 'text/html',
-            attachmentsPattern: 'trivy.txt'
+            """
+
+            emailext (
+                subject: "${jobName} - Build ${buildNumber} - ${pipelineStatus.toUpperCase()}",
+                body: body,
+                to: 'kdnsanthosh@gmail.com',
+                from: 'jenkins@example.com',
+                replyTo: 'santhosh.eng.devops@gmail.com',
+                mimeType: 'text/html',
+                attachmentsPattern: 'trivy-image-report.html'
+            )
         }
     }
+}
+
 }
